@@ -7,6 +7,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"google.golang.org/grpc"
 )
 
@@ -19,6 +21,11 @@ var (
 	ErrAlreadyClosed = errors.New("grpc pool: the connection was already closed")
 	// ErrFullPool is the error when the pool is already full
 	ErrFullPool = errors.New("grpc pool: closing a ClientConn into a full pool")
+
+	grpcChannelGauge = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "grpc_channels",
+		Help: "Total number of gRPC channels currently opened.",
+	})
 )
 
 // Factory is a function type creating a grpc client
@@ -84,6 +91,7 @@ func NewWithContext(ctx context.Context, factory FactoryWithContext, init, capac
 		p.maxLifeDuration = maxLifeDuration[0]
 	}
 	for i := 0; i < init; i++ {
+		grpcChannelGauge.Inc()
 		c, err := factory(ctx)
 		if err != nil {
 			return nil, err
@@ -166,12 +174,14 @@ func (p *Pool) Get(ctx context.Context) (*ClientConn, error) {
 	if wrapper.ClientConn != nil && idleTimeout > 0 &&
 		wrapper.timeUsed.Add(idleTimeout).Before(time.Now()) {
 
+		grpcChannelGauge.Dec()
 		wrapper.ClientConn.Close()
 		wrapper.ClientConn = nil
 	}
 
 	var err error
 	if wrapper.ClientConn == nil {
+		grpcChannelGauge.Inc()
 		wrapper.ClientConn, err = p.factory(ctx)
 		if err != nil {
 			// If there was an error, we want to put back a placeholder
@@ -215,6 +225,7 @@ func (c *ClientConn) Close() error {
 	if c.pool.IsClosed() {
 		return ErrClosed
 	}
+
 	// If the wrapper connection has become too old, we want to recycle it. To
 	// clarify the logic: if the sum of the initialization time and the max
 	// duration is before Now(), it means the initialization is so old adding
@@ -234,6 +245,7 @@ func (c *ClientConn) Close() error {
 		timeUsed:   time.Now(),
 	}
 	if c.unhealthy {
+		grpcChannelGauge.Dec()
 		wrapper.ClientConn.Close()
 		wrapper.ClientConn = nil
 	} else {
